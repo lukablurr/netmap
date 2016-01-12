@@ -13,6 +13,7 @@
 #define NETMAP_WITH_LIBS
 #include <net/netmap_user.h>
 #include <sys/poll.h>
+#include <pcap.h>
 
 int verbose = 0;
 
@@ -138,6 +139,88 @@ move(struct nm_desc *src, struct nm_desc *dst, u_int limit)
 	return (m);
 }
 
+#ifndef NO_PCAP
+struct filter_counter {
+	char *ifname;
+	uint64_t matched;
+	uint64_t total;
+	struct bpf_program fp;
+};
+
+static int
+filter_init(struct filter_counter *fc, char *ifname, const char *filter_exp)
+{
+	pcap_t *handle;
+	bpf_u_int32 net;
+	bpf_u_int32 mask;
+	char errbuf[PCAP_ERRBUF_SIZE];
+
+	fc->ifname = ifname;
+	fc->matched = fc->total = 0;
+
+	/* Find the properties for the device */
+	if (pcap_lookupnet(ifname, &net, &mask, errbuf) == -1) {
+		D("Couldn't get netmask for device %s: %s\n", ifname, errbuf);
+		mask = PCAP_NETMASK_UNKNOWN;
+	}
+
+	/* Open the session in promiscuous mode */
+	handle = pcap_open_live(ifname, BUFSIZ, 1, 0, errbuf);
+	if (handle == NULL) {
+		D("Couldn't open device %s: %s\n", ifname, errbuf);
+		return (-1);
+	}
+	/* Compile the filter */
+	if (pcap_compile(handle, &fc->fp, filter_exp, 0, mask) == -1) {
+		D("Couldn't parse filter: %s\n", filter_exp);
+		return (-2);
+	}
+
+	/* And close the session */
+	pcap_close(handle);
+
+	return 0;
+}
+
+static void
+filter_do(struct filter_counter *fc, struct nm_desc *nm, u_int limit)
+{
+	struct netmap_ring *rxring;
+	u_int si = nm->first_rx_ring;
+
+	while (si <= nm->last_rx_ring) {
+		u_int j, m = 0;
+
+		rxring = NETMAP_RXRING(nm->nifp, si);
+		if (nm_ring_empty(rxring)) {
+			si++;
+			continue;
+		}
+
+		j = rxring->cur; /* RX */
+		m = nm_ring_space(rxring);
+		if (m < limit)
+			limit = m;
+		while (limit-- > 0) {
+			struct netmap_slot *rs = &rxring->slot[j];
+			char *rxbuf = NETMAP_BUF(rxring, rs->buf_idx);
+
+			if (bpf_filter(fc->fp.bf_insns, (const u_char* ) rxbuf, rs->len, rs->len)) {
+				fc->matched++;
+			}
+			fc->total++;
+
+			j = nm_ring_next(rxring, j);
+		}
+
+		if (verbose && fc->total % 1000 == 0)
+			D("Matched %lu/%lu", fc->matched, fc->total);
+
+		si++;
+	}
+}
+#endif
+
 
 static void
 usage(void)
@@ -163,11 +246,15 @@ main(int argc, char **argv)
 	struct nm_desc *pa = NULL, *pb = NULL;
 	char *ifa = NULL, *ifb = NULL;
 	char ifabuf[64] = { 0 };
+#ifndef NO_PCAP
+	char *filter_exp = NULL;
+	struct filter_counter fc[2];
+#endif
 
 	fprintf(stderr, "%s built %s %s\n",
 		argv[0], __DATE__, __TIME__);
 
-	while ( (ch = getopt(argc, argv, "b:ci:vw:")) != -1) {
+	while ( (ch = getopt(argc, argv, "b:cf:i:vw:")) != -1) {
 		switch (ch) {
 		default:
 			D("bad option %c %s", ch, optarg);
@@ -188,6 +275,11 @@ main(int argc, char **argv)
 		case 'c':
 			zerocopy = 0; /* do not zerocopy */
 			break;
+#ifndef NO_PCAP
+		case 'f':
+			filter_exp = optarg;
+			break;
+#endif
 		case 'v':
 			verbose++;
 			break;
@@ -242,6 +334,18 @@ main(int argc, char **argv)
 	}
 	zerocopy = zerocopy && (pa->mem == pb->mem);
 	D("------- zerocopy %ssupported", zerocopy ? "" : "NOT ");
+#ifndef NO_PCAP
+	if (filter_exp) {
+		if (filter_init(&fc[0], ifa, filter_exp)) {
+			D("Error setting filter '%s' on if %s", filter_exp, ifa);
+			return (1);
+		}
+		if (filter_init(&fc[1], ifb, filter_exp)) {
+			D("Error setting filter '%s' on if %s", filter_exp, ifb);
+			return (1);
+		}
+	}
+#endif
 
 	/* setup poll(2) variables. */
 	memset(pollfd, 0, sizeof(pollfd));
@@ -316,6 +420,16 @@ main(int argc, char **argv)
 			D("error on fd1, rx [%d,%d,%d)",
 				rx->head, rx->cur, rx->tail);
 		}
+#ifndef NO_PCAP
+		if (filter_exp) {
+			if (pollfd[0].revents & POLLIN) {
+				filter_do(&fc[0], pa, burst);
+			}
+			if (pollfd[1].revents & POLLIN) {
+				filter_do(&fc[1], pb, burst);
+			}
+		}
+#endif
 		if (pollfd[0].revents & POLLOUT) {
 			move(pb, pa, burst);
 			// XXX we don't need the ioctl */
@@ -327,6 +441,12 @@ main(int argc, char **argv)
 			// ioctl(me[1].fd, NIOCTXSYNC, NULL);
 		}
 	}
+#ifndef NO_PCAP
+	if (filter_exp) {
+		D("if %s matched %lu/%lu", fc[0].ifname, fc[0].matched, fc[0].total);
+		D("if %s matched %lu/%lu", fc[1].ifname, fc[1].matched, fc[1].total);
+	}
+#endif
 	D("exiting");
 	nm_close(pb);
 	nm_close(pa);
