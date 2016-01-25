@@ -171,7 +171,7 @@ filter_init(struct filter_counter *fc, char *ifname, const char *filter_exp)
 		return (-1);
 	}
 	/* Compile the filter */
-	if (pcap_compile(handle, &fc->fp, filter_exp, 0, mask) == -1) {
+	if (pcap_compile(handle, &fc->fp, filter_exp, 1, mask) == -1) {
 		D("Couldn't parse filter: %s\n", filter_exp);
 		return (-2);
 	}
